@@ -41,5 +41,11 @@ bool appender_get_current_log_path(char* _log_path, unsigned int _len);
 bool appender_get_current_log_cache_path(char* _logPath, unsigned int _len);
 void appender_set_console_log(bool _is_open);
 
+/*
+ * By default, all logs will write to one file everyday. You can split logs to multi-file by changing max_file_size.
+ * 
+ * @param _max_byte_size    Max byte size of single log file, default is 0, meaning do not split.
+ */
+void appender_set_max_file_size(int _max_byte_size);
 
 #endif /* APPENDER_H_ */
