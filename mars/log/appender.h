@@ -23,6 +23,7 @@
 
 #include <string>
 #include <vector>
+#include <stdint.h>
 
 enum TAppenderMode
 {
@@ -46,6 +47,7 @@ void appender_set_console_log(bool _is_open);
  * 
  * @param _max_byte_size    Max byte size of single log file, default is 0, meaning do not split.
  */
-void appender_set_max_file_size(int _max_byte_size);
+void appender_set_max_file_size(uint64_t _max_byte_size);
+
 
 #endif /* APPENDER_H_ */

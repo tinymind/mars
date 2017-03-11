@@ -47,10 +47,12 @@
 
 #include <string>
 #include <algorithm>
+#include <set>
 
 #include "boost/bind.hpp"
 #include "boost/iostreams/device/mapped_file.hpp"
 #include "boost/filesystem.hpp"
+#include "boost/lexical_cast.hpp"
 
 #include "mars/comm/thread/lock.h"
 #include "mars/comm/thread/condition.h"
@@ -104,7 +106,7 @@ static bool sg_consolelog_open = true;
 static bool sg_consolelog_open = false;
 #endif
 
-static int sg_max_file_size = 0; // 0, will not split log file.
+static uint64_t sg_max_file_size = 0; // 0, will not split log file.
 
 static void __async_log_thread();
 static Thread sg_thread_async(&__async_log_thread);
@@ -149,37 +151,103 @@ static std::string __make_logfilenameprefix(const timeval& _tv, const char* _pre
     return filenameprefix;
 }
 
+static void __get_filenames_by_prefix(const std::string& _logdir, const std::string& _fileprefix, const std::string& _fileext, std::vector<std::string>& _filename_vec) {
+    
+    boost::filesystem::path path(_logdir);
+    if (!boost::filesystem::is_directory(path)) {
+        return;
+    }
+    
+    boost::filesystem::directory_iterator end_iter;
+    std::string filename;
+    
+    for (boost::filesystem::directory_iterator iter(path); iter != end_iter; ++iter) {
+        if (boost::filesystem::is_regular_file(iter->status())) {
+            filename = iter->path().filename().string();
+            if (strutil::StartsWith(filename, _fileprefix) && strutil::EndsWith(filename, _fileext)) {
+                _filename_vec.push_back(filename);
+            }
+        }
+    }
+}
+
+static void __get_filepaths_from_timeval(const timeval& _tv, const std::string& _logdir, const char* _prefix, const std::string& _fileext, std::vector<std::string>& _filepath_vec) {
+    
+    std::string fileprefix = __make_logfilenameprefix(_tv, _prefix);
+    std::vector<std::string> filename_vec;
+    __get_filenames_by_prefix(_logdir, fileprefix, _fileext, filename_vec);
+    
+    for (std::vector<std::string>::iterator iter = filename_vec.begin(); iter != filename_vec.end(); ++ iter) {
+        _filepath_vec.push_back(_logdir + "/" + (*iter));
+    }
+}
+
+static bool __string_compare_greater(const std::string& s1, const std::string& s2) {
+    if (s1.length() == s2.length()) {
+        return s1 > s2;
+    }
+    return s1.length() > s2.length();
+}
+
+static uint64_t __get_next_fileindex(const std::string& _fileprefix, const std::string& _fileext) {
+    
+    std::vector<std::string> filename_vec;
+    __get_filenames_by_prefix(sg_logdir, _fileprefix, _fileext, filename_vec);
+    if (!sg_cache_logdir.empty()) {
+        __get_filenames_by_prefix(sg_cache_logdir, _fileprefix, _fileext, filename_vec);
+    }
+    
+    uint64_t index = 0;
+    if (filename_vec.empty()) {
+        return index;
+    }
+    // high -> low
+    std::sort(filename_vec.begin(), filename_vec.end(), __string_compare_greater);
+    std::string last_filename = *(filename_vec.begin());
+    std::size_t ext_pos = last_filename.find("." + _fileext);
+    std::size_t index_len = ext_pos - _fileprefix.length();
+    if (index_len > 0) {
+        std::string index_str = last_filename.substr(_fileprefix.length(), index_len);
+        if (strutil::StartsWith(index_str, "_")) {
+            index_str = index_str.substr(1);
+        }
+        index = boost::lexical_cast<uint64_t>(index_str);
+    }
+    
+    uint64_t filesize = 0;
+    std::string logfilepath = sg_logdir + "/" + last_filename;
+    if (boost::filesystem::exists(logfilepath)) {
+        filesize += boost::filesystem::file_size(logfilepath);
+    }
+    if (!sg_cache_logdir.empty()) {
+        logfilepath = sg_cache_logdir + "/" + last_filename;
+        if (boost::filesystem::exists(logfilepath)) {
+            filesize += boost::filesystem::file_size(logfilepath);
+        }
+    }
+    return (filesize > sg_max_file_size) ? index + 1 : index;
+}
+
 static void __make_logfilename(const timeval& _tv, const std::string& _logdir, const char* _prefix, const std::string& _fileext, char* _filepath, unsigned int _len) {
     
-    std::string logfilepathprefix = _logdir;
-    logfilepathprefix += "/";
-    logfilepathprefix += __make_logfilenameprefix(_tv, _prefix);
+    uint64_t index = 0;
+    std::string logfilenameprefix = __make_logfilenameprefix(_tv, _prefix);
+    if (sg_max_file_size > 0) {
+        index = __get_next_fileindex(logfilenameprefix, _fileext);
+    }
     
-    std::string logfilepath = logfilepathprefix;
+    std::string logfilepath = _logdir;
+    logfilepath += "/";
+    logfilepath += logfilenameprefix;
+    
+    if (index > 0) {
+        char temp[24] = {0};
+        snprintf(temp, 24, "_%llu", index);
+        logfilepath += temp;
+    }
+    
     logfilepath += ".";
     logfilepath += _fileext;
-    
-    if (sg_max_file_size > 0 && boost::filesystem::exists(logfilepath) && boost::filesystem::file_size(logfilepath) > sg_max_file_size) {
-        int index = 1;
-        do {
-            logfilepath = logfilepathprefix;
-            logfilepath += "_";
-            
-            char indexStr[21]; // enough to hold all numbers up to 64-bits
-            sprintf(indexStr, "%d", index);
-            
-            logfilepath += indexStr;
-            logfilepath += ".";
-            logfilepath += _fileext;
-            
-            if (!boost::filesystem::exists(logfilepath) || boost::filesystem::file_size(logfilepath) < sg_max_file_size) {
-                break;
-            }
-            
-            ++ index;
-            
-        } while (true);
-    }
     
     strncpy(_filepath, logfilepath.c_str(), _len - 1);
     _filepath[_len - 1] = '\0';
@@ -298,7 +366,7 @@ static void __move_old_files(const std::string& _src_path, const std::string& _d
     boost::filesystem::directory_iterator end_iter;
     for (boost::filesystem::directory_iterator iter(path); iter != end_iter; ++iter) {
         
-        if (!strutil::StartsWith(iter->path().string(), _nameprefix) || !strutil::EndsWith(iter->path().string(), LOG_EXT)) {
+        if (!strutil::StartsWith(iter->path().filename().string(), _nameprefix) || !strutil::EndsWith(iter->path().string(), LOG_EXT)) {
             continue;
         }
         
@@ -923,33 +991,12 @@ void appender_set_console_log(bool _is_open) {
     sg_consolelog_open = _is_open;
 }
 
-void appender_setExtraMSg(const char* _msg, unsigned int _len) {
-    sg_log_extra_msg = std::string(_msg, _len);
-}
-
-void appender_set_max_file_size(int _max_byte_size) {
+void appender_set_max_file_size(uint64_t _max_byte_size) {
     sg_max_file_size = _max_byte_size;
 }
 
-void appender_getmultifilepath_from_timeval(const timeval& _tv, const std::string& _logdir, const char* _prefix, const std::string& _fileext, std::vector<std::string>& _filepath_vec) {
-    
-    boost::filesystem::path path(_logdir);
-    if (!boost::filesystem::is_directory(path)) {
-        return;
-    }
-    
-    std::string fileprefix = __make_logfilenameprefix(_tv, _prefix);
-    boost::filesystem::directory_iterator end_iter;
-    std::string filename;
-    
-    for (boost::filesystem::directory_iterator iter(path); iter != end_iter; ++iter) {
-        if (boost::filesystem::is_regular_file(iter->status())) {
-            filename = iter->path().filename().string();
-            if (strutil::StartsWith(filename, fileprefix) && strutil::EndsWith(filename, _fileext)) {
-                _filepath_vec.push_back(_logdir + "/" + filename);
-            }
-        }
-    }
+void appender_setExtraMSg(const char* _msg, unsigned int _len) {
+    sg_log_extra_msg = std::string(_msg, _len);
 }
 
 bool appender_getfilepath_from_timespan(int _timespan, const char* _prefix, std::vector<std::string>& _filepath_vec) {
@@ -959,28 +1006,9 @@ bool appender_getfilepath_from_timespan(int _timespan, const char* _prefix, std:
     gettimeofday(&tv, NULL);
     tv.tv_sec -= _timespan * (24 * 60 * 60);
 
-    if (sg_max_file_size <= 0) {
-        char log_path[2048] = { 0 };
-        __make_logfilename(tv, sg_logdir, _prefix, LOG_EXT, log_path, sizeof(log_path));
-        
-        _filepath_vec.push_back(log_path);
-        
-        if (sg_cache_logdir.empty()) {
-            return true;
-        }
-        
-        memset(log_path, 0, sizeof(log_path));
-        __make_logfilename(tv, sg_cache_logdir, _prefix, LOG_EXT, log_path, sizeof(log_path));
-        
-        _filepath_vec.push_back(log_path);
-        
-        return true;
+    __get_filepaths_from_timeval(tv, sg_logdir, _prefix, LOG_EXT, _filepath_vec);
+    if (!sg_cache_logdir.empty()) {
+        __get_filepaths_from_timeval(tv, sg_cache_logdir, _prefix, LOG_EXT, _filepath_vec);
     }
-    else {
-        appender_getmultifilepath_from_timeval(tv, sg_logdir, _prefix, LOG_EXT, _filepath_vec);
-        if (!sg_cache_logdir.empty()) {
-            appender_getmultifilepath_from_timeval(tv, sg_cache_logdir, _prefix, LOG_EXT, _filepath_vec);
-        }
-        return true;
-    }
+    return true;
 }
