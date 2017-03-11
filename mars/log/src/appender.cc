@@ -47,7 +47,6 @@
 
 #include <string>
 #include <algorithm>
-#include <set>
 
 #include "boost/bind.hpp"
 #include "boost/iostreams/device/mapped_file.hpp"
