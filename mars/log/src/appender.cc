@@ -51,7 +51,6 @@
 #include "boost/bind.hpp"
 #include "boost/iostreams/device/mapped_file.hpp"
 #include "boost/filesystem.hpp"
-#include "boost/lexical_cast.hpp"
 
 #include "mars/comm/thread/lock.h"
 #include "mars/comm/thread/condition.h"
@@ -188,7 +187,7 @@ static bool __string_compare_greater(const std::string& s1, const std::string& s
     return s1.length() > s2.length();
 }
 
-static uint64_t __get_next_fileindex(const std::string& _fileprefix, const std::string& _fileext) {
+static long __get_next_fileindex(const std::string& _fileprefix, const std::string& _fileext) {
     
     std::vector<std::string> filename_vec;
     __get_filenames_by_prefix(sg_logdir, _fileprefix, _fileext, filename_vec);
@@ -196,21 +195,21 @@ static uint64_t __get_next_fileindex(const std::string& _fileprefix, const std::
         __get_filenames_by_prefix(sg_cache_logdir, _fileprefix, _fileext, filename_vec);
     }
     
-    uint64_t index = 0;
+    long index = 0; // long is enought to hold all indexes in one day.
     if (filename_vec.empty()) {
         return index;
     }
     // high -> low
     std::sort(filename_vec.begin(), filename_vec.end(), __string_compare_greater);
     std::string last_filename = *(filename_vec.begin());
-    std::size_t ext_pos = last_filename.find("." + _fileext);
+    std::size_t ext_pos = last_filename.rfind("." + _fileext);
     std::size_t index_len = ext_pos - _fileprefix.length();
     if (index_len > 0) {
         std::string index_str = last_filename.substr(_fileprefix.length(), index_len);
         if (strutil::StartsWith(index_str, "_")) {
             index_str = index_str.substr(1);
         }
-        index = boost::lexical_cast<uint64_t>(index_str);
+        index = atol(index_str.c_str());
     }
     
     uint64_t filesize = 0;
@@ -229,7 +228,7 @@ static uint64_t __get_next_fileindex(const std::string& _fileprefix, const std::
 
 static void __make_logfilename(const timeval& _tv, const std::string& _logdir, const char* _prefix, const std::string& _fileext, char* _filepath, unsigned int _len) {
     
-    uint64_t index = 0;
+    long index = 0;
     std::string logfilenameprefix = __make_logfilenameprefix(_tv, _prefix);
     if (sg_max_file_size > 0) {
         index = __get_next_fileindex(logfilenameprefix, _fileext);
@@ -241,7 +240,7 @@ static void __make_logfilename(const timeval& _tv, const std::string& _logdir, c
     
     if (index > 0) {
         char temp[24] = {0};
-        snprintf(temp, 24, "_%llu", index);
+        snprintf(temp, 24, "_%ld", index);
         logfilepath += temp;
     }
     
@@ -362,6 +361,9 @@ static void __move_old_files(const std::string& _src_path, const std::string& _d
     
     ScopedLock lock_file(sg_mutex_log_file);
     
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    
     boost::filesystem::directory_iterator end_iter;
     for (boost::filesystem::directory_iterator iter(path); iter != end_iter; ++iter) {
         
@@ -369,9 +371,10 @@ static void __move_old_files(const std::string& _src_path, const std::string& _d
             continue;
         }
         
-        std::string des_file_name = _dest_path + "/" + iter->path().filename().string();
+        char logfilepath[1024] = {0};
+        __make_logfilename(tv, _dest_path, sg_logfileprefix.c_str(), LOG_EXT, logfilepath , 1024);
         
-        if (!__append_file(iter->path().string(), des_file_name)) {
+        if (!__append_file(iter->path().string(), logfilepath)) {
             break;
         }
         
